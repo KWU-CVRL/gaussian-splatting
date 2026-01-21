@@ -45,15 +45,18 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
-
+                        # q = [w, x, y, z]  # 임의 quaternion
+                        # ||q|| = sqrt(w² + x² + y²  + z²)  # 크기 계산
+                        # q_normalized = q / ||q||  # 각 원소를 크기로 나눔   
+        # 즉, 학습하다 크기가 1을 벗어나면 다시 크기가 1이 되도록 정규화
 
     def __init__(self, sh_degree, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
+        self._features_dc = torch.empty(0) # default color
+        self._features_rest = torch.empty(0) # rest of SH coefficients
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -65,7 +68,7 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
-    def capture(self):
+    def capture(self): #모델 저장
         return (
             self.active_sh_degree,
             self._xyz,
@@ -81,7 +84,7 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args): #저장된 모델 복원
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -99,7 +102,7 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
-    @property
+    @property # getter 함수
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
     
@@ -147,33 +150,51 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
-        self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        # Point cloud로부터 Gaussian 파라미터 초기화
+        
+        self.spatial_lr_scale = spatial_lr_scale  # Learning rate scaling factor 저장 (scene 크기에 따라 조절)
+        
+        # 1. 위치(xyz) 초기화: point cloud의 좌표를 그대로 사용
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()  # (N, 3) numpy → CUDA tensor
+        
+        # 2. 색상(SH features) 초기화
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())  # RGB → SH DC component
+        # (N, 3, SH_coeffs) 크기의 SH 계수 텐서 생성. SH_degree=3이면 (3+1)^2=16개 계수
+        # (N, 3, 16)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+        features[:, :3, 0 ] = fused_color  # DC component (0차 SH)만 초기 색상으로 채우기
+        features[:, 3:, 1:] = 0.0  # 나머지 고차 SH 계수는 0으로 초기화 (학습하면서 채워짐)
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
-        rots[:, 0] = 1
+        # 3. Scaling 초기화: k-NN 거리 기반
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)  # 각 point의 k-NN 평균 거리^2 (최소값 방지)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)  # log(거리) → (N, 1) → (N, 3) 복제 (x,y,z 동일)
+        
+        # 4. Rotation 초기화: 단위 quaternion [1, 0, 0, 0]
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")  # (N, 4) quaternion
+        rots[:, 0] = 1  # w=1, x=y=z=0 → 회전 없음 (identity rotation)
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # 5. Opacity 초기화: 0.1 (inverse sigmoid 적용)
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))  # 0.1 → unbounded space
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+        # 모든 파라미터를 nn.Parameter로 등록 (학습 가능하도록)
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))  # 위치
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))  # DC: (N,3,1) → (N,1,3)
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))  # 나머지: (N,3,15) → (N,15,3)
+        self._scaling = nn.Parameter(scales.requires_grad_(True))  # log-space scaling
+        self._rotation = nn.Parameter(rots.requires_grad_(True))  # quaternion
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))  # unbounded opacity
+        
+        # 보조 변수들 초기화
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  # 각 Gaussian의 최대 화면 크기 (densification용)
+        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}  # 이미지 이름 → exposure index 매핑
+        self.pretrained_exposures = None  # 사전 학습된 exposure 없음
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)  # (N_cams, 3, 4) identity affine transform
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))  # 각 카메라마다 exposure 파라미터 (색상 보정)
+        
+        # Chummary 9
+        # Point cloud로부터 Gaussian 초기화: 위치는 그대로, 색상은 SH로 변환, scaling은 k-NN 거리, rotation은 identity, opacity는 0.1
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
