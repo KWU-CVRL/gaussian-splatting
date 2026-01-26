@@ -60,11 +60,11 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
-        self.denom = torch.empty(0)
-        self.optimizer = None
-        self.percent_dense = 0
+        self.max_radii2D = torch.empty(0)           #각 Gaussian의 최대 화면 크기, pixel 단위 
+        self.xyz_gradient_accum = torch.empty(0)    # xyz 위치 gradient 누적값
+        self.denom = torch.empty(0)                 # 누적 카운터
+        self.optimizer = None                       # Gaussian 파라미터용 optimizer Adam, SGD
+        self.percent_dense = 0                      # densification 기준값. split, clone의 기준
         self.spatial_lr_scale = 0
         self.setup_functions()
 
@@ -148,6 +148,8 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+    #Chummary 8  
+    #Gaussian의 속성을 정의하고, 저장, 다시 불러올 때 필요한 변수 및 함수
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         # Point cloud로부터 Gaussian 파라미터 초기화
@@ -155,30 +157,54 @@ class GaussianModel:
         self.spatial_lr_scale = spatial_lr_scale  # Learning rate scaling factor 저장 (scene 크기에 따라 조절)
         
         # 1. 위치(xyz) 초기화: point cloud의 좌표를 그대로 사용
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()  # (N, 3) numpy → CUDA tensor
+        # (N, 3) numpy → CUDA tensor
+        # CUDA로 copy
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()  
         
         # 2. 색상(SH features) 초기화
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())  # RGB → SH DC component
         # (N, 3, SH_coeffs) 크기의 SH 계수 텐서 생성. SH_degree=3이면 (3+1)^2=16개 계수
         # (N, 3, 16)
+        # RGB → SH DC component
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())  
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+
+        #SH 계수를 0차항과 나머지 차수를 분리하여 초기화
         features[:, :3, 0 ] = fused_color  # DC component (0차 SH)만 초기 색상으로 채우기
         features[:, 3:, 1:] = 0.0  # 나머지 고차 SH 계수는 0으로 초기화 (학습하면서 채워짐)
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         # 3. Scaling 초기화: k-NN 거리 기반
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)  # 각 point의 k-NN 평균 거리^2 (최소값 방지)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)  # log(거리) → (N, 1) → (N, 3) 복제 (x,y,z 동일)
+        # distCUDA2가 KNN, from simple_knn._C import distCUDA2
+        # 각 point의 k-NN 평균 거리^2 (최소값 방지)
+        # L2Norm
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)  
+
+        # dist2를 받아서 루트 씌우고 log로 변환해서  x, y, z 각각에 복제(repeat), 즉 sphere로 초기화
+        # log scale 씌우는 이유는 항상 양수여야 하기 때문
+        # positive semi-definite covariance를 위해                                                                                                                         
+
+        # Chummary 8에서, scale은 torch.exp(self._scaling)로 계산
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)  
         
         # 4. Rotation 초기화: 단위 quaternion [1, 0, 0, 0]
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")  # (N, 4) quaternion
+        # (N, 4) quaternion
+        # CPU 거치지 않고 바로 CUDA에 tensor 생성
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")  
         rots[:, 0] = 1  # w=1, x=y=z=0 → 회전 없음 (identity rotation)
 
         # 5. Opacity 초기화: 0.1 (inverse sigmoid 적용)
+        # CPU 거치지 않고 바로 CUDA에 tensor 생성
+        # 최소한 0.1로 학습가능하도록 하면서, inverse sigmoid로 unbound 한 뒤, 나중에 다시 sigmoid로 매핑해서
+        # 음수가 되는 것 방지 및 학습 시 0 ~ 1 사이 확보 가능토록 함 (음수도 신경써야하지만, 그대로 쓰면 1 넘어갈 수 이)
+        # self._opacity = inverse_sigmoid(0.1) = -2.2
+        # get_opacity = sigmoid(-2.2) = 0.1  # ✅ 원하는 0.1!
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))  # 0.1 → unbounded space
 
         # 모든 파라미터를 nn.Parameter로 등록 (학습 가능하도록)
+        # requires_grad_(True) 설정을 통해 torch가 backward() 콜하면 gradient 계산 가능하도록 함
+        # _ operator가 있기 때문에, 바로바로 해당 파라미터를 업데이트. 없는 녀석은 새로운 tensor를 만들어서 optimizer에 등록
+        # transpose, contigous는 읽는 순서를 정렬. 순서 뒤죽박죽 되지 않도록
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))  # 위치
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))  # DC: (N,3,1) → (N,1,3)
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))  # 나머지: (N,3,15) → (N,15,3)
@@ -190,17 +216,30 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  # 각 Gaussian의 최대 화면 크기 (densification용)
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}  # 이미지 이름 → exposure index 매핑
         self.pretrained_exposures = None  # 사전 학습된 exposure 없음
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)  # (N_cams, 3, 4) identity affine transform
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))  # 각 카메라마다 exposure 파라미터 (색상 보정)
+        # (N_cams, 3, 4) identity affine transform
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)  
+        # 각 카메라마다 exposure 파라미터 (색상 보정)
+        # 이미지 프레임마다 보정
+        # 혹시 이것때문에얼룩덜룩해지나..?
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))  
         
         # Chummary 9
         # Point cloud로부터 Gaussian 초기화: 위치는 그대로, 색상은 SH로 변환, scaling은 k-NN 거리, rotation은 identity, opacity는 0.1
+        # 이 단계에서 CUDA로 대부분의 data를 복사해서 넘겨줌.
 
     def training_setup(self, training_args):
+
+        #densification percentage 
         self.percent_dense = training_args.percent_dense
+
+        # gradient accumulation
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        # denominator(분모), 즉 몇번 accum되었는지 count
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+
+        # 각 파라미터 그룹과 learning rate 지정
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -210,9 +249,11 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
+        # Default는 Adam optimizer
+        # 앞서 l list에 정의된대로 들어감. 0.0은 기본값일뿐
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        elif self.optimizer_type == "sparse_adam":
+        elif self.optimizer_type == "sparse_adam": # 현재 view에 있는것만, 그런데대부분 일반 Adam으로
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
@@ -222,15 +263,28 @@ class GaussianModel:
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,                                                
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        
+                                                    #초기엔 빠르게, 나중엔 천천히 감소하도록. 
+                                                    #step를 보통 같이쓰는데, 처음부터 init같이 큰 lr로 쓰면 불안정할 수  있음
+                                                    #따라서, delay step로 천천히 움직이다 init로 학습
+                                                    #이후 lr_delay_mult로 천천히 감소
         
         self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+    # Chummary 9 
+    # Gaussian 모델 학습 준비: optimizer 설정, learning rate 스케줄러 정의, gradient 누적용 변수 초기화
+
+
+
+
+    # lr 조정
+    # 나머지는 learning rate 고정
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
@@ -243,6 +297,8 @@ class GaussianModel:
                 param_group['lr'] = lr
                 return lr
 
+
+    # ply 저장용 attribute 리스트 생성
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         # All channels except the 3 DC
@@ -260,6 +316,8 @@ class GaussianModel:
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
+        #detatch로 학습에서 분리, cpu로 다시 가져와 numpy형태로 저장
+        # 학습할땐 CUDA의 tensor로 작업
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
@@ -268,13 +326,23 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
+        # 전부 float32로 저장
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
+        #데이터 저장할 빈 배열 만들고
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
+
+        # gaussian attributes들 모아서
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+
+        #각 attribute 이름에 맞게 데이터 채우기
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+    # densification 과정에서 opacity 리셋
+    # 0.01보다 크면 3000iter 마다 호출 다 0.01로 맞춤
+    # 0.01보다 작으면 투명하니 투명한데, opaque한 녀석들은 다시 학습해보도록
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -334,6 +402,9 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+
+    # 3000 iter마다 호출되는 opacity 초기화 시에, gradient momentum도 초기화
+    # name이 opacity이므로, opacity만 초기화
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -348,6 +419,7 @@ class GaussianModel:
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
+    
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
