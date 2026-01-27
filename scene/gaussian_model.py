@@ -277,7 +277,7 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
-    # Chummary 9 
+    # Chummary 10 
     # Gaussian 모델 학습 준비: optimizer 설정, learning rate 스케줄러 정의, gradient 누적용 변수 초기화
 
 
@@ -421,6 +421,11 @@ class GaussianModel:
         return optimizable_tensors
     
 
+
+    #mask는 boolean tensor
+    #즉, 학습 도중 point 제거할 때, optimizer에서 해당 파라미터들도 제거
+    #바로 밑의 prune_points에서 호출
+    #
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -429,17 +434,47 @@ class GaussianModel:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
+                #파라미터 제거
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
                 self.optimizer.state[group['params'][0]] = stored_state
-
                 optimizable_tensors[group["name"]] = group["params"][0]
+
+
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
+    
+
+            #     # 원본 데이터
+            # xyz = torch.tensor([[1,2,3],    # Gaussian 0
+            #                     [4,5,6],    # Gaussian 1
+            #                     [7,8,9],    # Gaussian 2
+            #                     [10,11,12], # Gaussian 3
+            #                     [13,14,15]])# Gaussian 4
+
+            # mask = torch.tensor([True, False, True, False, True])
+
+            # # Filtering
+            # xyz[mask]
+            # # 결과:
+            # # tensor([[1,2,3],    # 0번 유지
+            # #         [7,8,9],    # 2번 유지
+            # #         [13,14,15]]) # 4번 유지
+            # # → 1번, 3번(False)은 삭제됨
+
+            # prune_points 호출 시
+            # mask = [True, True, False, True, False]  # 제거할 Gaussian
+            # valid_points_mask = ~mask  # 반전!
+            # # [False, False, True, False, True]
+
+            # _prune_optimizer(valid_points_mask)
+            # # → False인 0,1,3번 유지
+            # # → True인 2,4번 제거
 
     def prune_points(self, mask):
+        #true인 녀석들을 제거하기 위해 flip 시키기
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -455,30 +490,50 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
-
+        # Chummary 14 
+        # prune_points: mask가 True인 Gaussian 제거
+        # mask 반전(~) 후 _prune_optimizer 호출해서 optimizer와 파라미터 동기화
+        # 보조 변수(gradient_accum, denom, max_radii2D)도 함께 필터링
+    
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            #각 파라미터그룹엔 하나씩만 있어야함을 강제
             assert len(group["params"]) == 1
-            extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
 
+            # new_params 가져오기
+            extension_tensor = tensors_dict[group["name"]]
+
+            #기존의 파라미터 가져오기
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+
+            
+            if stored_state is not None:
+                #gradient도 확장해서 차원 늘림 (10 > 14로)
                 stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
+                #concat 해서 저장해뒀으니 기존 파라미터는 지움
                 del self.optimizer.state[group['params'][0]]
+
+                # parameter group에 새로운 파라미터로 바꿈
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
+                #return할 tensor에 추가
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
+    # Chummary 12
+    # densification 과정에서 새로운 gaussian 추가 시에, optimizer에도 해당 파라미터들 추가
+    # 추가하면서 기존 파라미터를 교체하고, 차원도 늘어남
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+
+        # 새로운 파라미터 모음
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -486,7 +541,10 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation}
 
+        #최적화 할 녀석들 optimizer에 추가
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
+
+        #확장된 tensor로 교체
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -494,26 +552,63 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # 현재 split/clone한 애들을 기존의 radii에 추가
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
+
+        # 다시 clone/split 판단하기 위해 초기화
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # Chummary 13
+        # densification(split/clone)후에 optimizer에 새로운 파라미터 추가하고,
+        # 기존 누적된 변수들 초기화
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+
+        # 현재 gaussian 개수 받아와서
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
-        padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
+        #gradients가 (N, 3)인데, point 개수보다 작을 수 있음
+        #따라서, point 개수에 맞게 0으로 padding
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+
+        #grdeient 복사
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+
+        #gradient가 크면 True인 mask 생성(크다는건 좀 이상하단 것)
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+
+        #즉, scale크고, gradient도 큰 녀석만 선택
+        selected_pts_mask = torch.logical_and(selected_pts_mask, # 여기서 위에 조건 추가 해서 and
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        
+        #split 할 gaussian scale 가져오기
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+
+        #새로운 gaussian 위치 계산
+        #0이어서, split할 대상의 위치로 초기화
         means =torch.zeros((stds.size(0), 3),device="cuda")
+
+        # 새로운 gaussian 위치는, 기존 gaussian 위치 + 
+        # torch.normal : normal distribution에서 샘플링한 값
+        # (N, 3) vector
         samples = torch.normal(mean=means, std=stds)
+
+        # quaternion → 3x3 rotation matrix로 변환
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+
+        # 새로운 gaussian 위치 계산
+        # bmm은 batch matrix multiplication, 200개의 points 가 있다면 200개에 모두 동일한 rots 곱하도록.
+        # bmm은, 3차원만 받기에 samples에 unsqueeze(1)로 1차원 추가해서 bmm 한 후, 다시 squeeze(-1)로 제거
+        # 이렇게 계산해서 구한 새로운 xyz 값에, 원래 gaussian 위치를 더해줌
+        # rots:(N, 3, 3), samples:(N, 3), unsqueeze  → (N, 3, 1),  squeeze → (N, 3)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+
+        #작아지는 scale을 혹시나몰라 log로 0이상 되도록.. N=2면 1.6 으로 나눠줌
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        
+        #나머지는 일단 그대로 복사
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
@@ -524,7 +619,12 @@ class GaussianModel:
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
+        # Chummary 11
+        # densification: gradient가 크고 scale이 큰 녀석들을 N = 2 개로 split
+        # split된 녀석들은 원래 녀석 제거
 
+
+    # clone은 말그대로 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -542,6 +642,8 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
+
+    # densification과 pruning을 한번에 수행
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -550,17 +652,38 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
+        #split, clone 할거 다하고 prune
+        # self.get_opacity: sigmoid 적용된 값 (0~1)
+        # min_opacity: 보통 0.005
+        # opacity < 0.005면 True (제거 대상)
+        # squeeze(): (N, 1) → (N,) 차원 축소
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+
+        #추가 prune 조건인데, 너무크면 없앰 (20pixel 이상)
         if max_screen_size:
+            #local space(camera view에서 본것)
             big_points_vs = self.max_radii2D > max_screen_size
+
+            #world space(지금까지 보인것중 젤 큰것)
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+
+            # 세 가지 조건 중 하나라도 True면 제거
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
+        # Chummary 15
+        # densification과 pruning을 한번에 수행하는 함수
+        # Pruning은 말그대로 없애는 것이기 때문에, point와 gradient를 prune_points로 제거
+        
+        # densify_and_prune: clone/split 후 pruning 수행
+        # Pruning 조건: 1) opacity < 0.005, 2) 화면 크기 > 20px, 3) world scaling > scene*0.1
+        # prune_points로 제거 후 tmp_radii 정리, CUDA 캐시 해제
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+        #gaussian gradient(position) 누적하고, 카운트 업데이트
