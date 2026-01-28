@@ -53,31 +53,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     #ChuStep_2
     gaussians.training_setup(opt)
+
+    #저장된것 있으면 restore
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # black이 default, 혹시나 배경 밝게하고싶으면 white_background option
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    #cuda에서 시작, 종료 시간 기록
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    # sparse adam optimizer 사용여부 확인
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
+    #trainset 카메라 리스트 복사 및 인덱스 생성
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
+
+    #exponential moveing average for logging(기록용 loss 평균)
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    #tqdm progress bar 생성 (예: 0/30000 → 30000/30000)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+    #SIBR viewer와 통신
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
             try:
+                #실시간으로 novel view를 보도록
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
@@ -88,7 +100,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     break
             except Exception as e:
                 network_gui.conn = None
-
+        
+        #시작시간 체크
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -98,12 +111,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+        # viewpoint_stack이 비었으면 다시 채우기
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
+            viewpoint_stack = scene.getTrainCameras().copy() # 모든 카메라 다시 복사
+            viewpoint_indices = list(range(len(viewpoint_stack))) # 인덱스도 다시 생성
+
+        # 랜덤 인덱스 선택
         rand_idx = randint(0, len(viewpoint_indices) - 1)
+
+        # 카메라 꺼내기 (pop = 리스트에서 제거하면서 반환)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
+
+        # 인덱스도 같이 제거
         vind = viewpoint_indices.pop(rand_idx)
+        # Chummary 16
+        # Gaussian initialization을 한 뒤, training시에 필요한 카메라를 랜덤하게 뽑음
+        #뽑고 난 카메라들은 사용하고 pop으로 버림
 
         # Render
         if (iteration - 1) == debug_from:
@@ -111,9 +134,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+        #rendering
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+
+        #혹시나 물체만 있는 scene이라면 mask 씌워서 object만 학습하도록
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
@@ -122,6 +149,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
+            # Fused SSIM 사용 가능하면 사용
+            # (N, C, H, W) 형태로 넣어야함 > unsqueeze(0) 추가
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
@@ -129,6 +158,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
+        # inverse depth로 계산
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
@@ -144,8 +174,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
+        #끝나는 시점 체크
         iter_end.record()
 
+        #로그 기록/저장용
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
